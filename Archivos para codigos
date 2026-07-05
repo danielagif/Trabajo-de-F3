@@ -1,0 +1,652 @@
+"""
+Archivo principal del sistema de gestion de almacen.
+"""
+
+from database import inicializar_base_datos
+from productos_ui import mostrar_menu_productos
+
+
+def main():
+    inicializar_base_datos()
+
+    while True:
+        print(
+            """
+=== Sistema inteligente de gestion de almacen ===
+1. Gestion de productos
+0. Salir
+"""
+        )
+        opcion = input("Seleccione una opcion: ").strip()
+
+        if opcion == "1":
+            mostrar_menu_productos()
+        elif opcion == "0":
+            print("Gracias por usar el sistema.")
+            break
+        else:
+            print("Opcion no valida. Intente nuevamente.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+"""
+Logica de negocio para el modulo de productos.
+"""
+
+import sqlite3
+
+import pandas as pd
+
+from database import obtener_conexion
+
+
+CAMPOS_EDITABLES = {
+    "codigo_barras",
+    "nombre",
+    "descripcion",
+    "categoria",
+    "unidad_medida",
+    "stock_actual",
+    "stock_minimo",
+    "precio_compra",
+    "precio_venta",
+    "id_proveedor",
+    "estado",
+}
+
+
+def _fila_a_diccionario(fila):
+    return dict(fila) if fila else None
+
+
+def validar_codigo_duplicado(codigo_barras, id_producto_excluir=None):
+    """
+    Verifica si ya existe un producto con el mismo codigo de barras.
+    """
+    conexion = None
+
+    try:
+        conexion = obtener_conexion()
+        conexion.row_factory = sqlite3.Row
+        cursor = conexion.cursor()
+
+        consulta = "SELECT id_producto FROM productos WHERE codigo_barras = ?"
+        parametros = [codigo_barras]
+
+        if id_producto_excluir is not None:
+            consulta += " AND id_producto <> ?"
+            parametros.append(id_producto_excluir)
+
+        cursor.execute(consulta, parametros)
+        return cursor.fetchone() is not None
+    except sqlite3.Error as error:
+        print(f"Error al validar codigo duplicado: {error}")
+        return True
+    finally:
+        if conexion:
+            conexion.close()
+
+
+def registrar_producto(
+    codigo_barras,
+    nombre,
+    descripcion,
+    categoria,
+    unidad_medida,
+    stock_actual,
+    stock_minimo,
+    precio_compra,
+    precio_venta,
+    id_proveedor=None,
+):
+    """
+    Registra un nuevo producto despues de validar que el codigo no exista.
+    """
+    if validar_codigo_duplicado(codigo_barras):
+        return False, "Ya existe un producto con ese codigo de barras."
+
+    conexion = None
+
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor()
+        cursor.execute(
+            """
+            INSERT INTO productos (
+                codigo_barras,
+                nombre,
+                descripcion,
+                categoria,
+                unidad_medida,
+                stock_actual,
+                stock_minimo,
+                precio_compra,
+                precio_venta,
+                id_proveedor
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                codigo_barras,
+                nombre,
+                descripcion,
+                categoria,
+                unidad_medida,
+                stock_actual,
+                stock_minimo,
+                precio_compra,
+                precio_venta,
+                id_proveedor,
+            ),
+        )
+        conexion.commit()
+        return True, "Producto registrado correctamente."
+    except sqlite3.IntegrityError as error:
+        if conexion:
+            conexion.rollback()
+        return False, f"No se pudo registrar el producto: {error}"
+    except sqlite3.Error as error:
+        if conexion:
+            conexion.rollback()
+        return False, f"Error de SQLite al registrar producto: {error}"
+    finally:
+        if conexion:
+            conexion.close()
+
+
+def editar_producto(id_producto, **kwargs):
+    """
+    Edita un producto usando campos dinamicos recibidos como argumentos.
+    """
+    datos = {
+        campo: valor
+        for campo, valor in kwargs.items()
+        if campo in CAMPOS_EDITABLES and valor is not None
+    }
+
+    if not datos:
+        return False, "No se recibieron campos validos para actualizar."
+
+    if "codigo_barras" in datos and validar_codigo_duplicado(
+        datos["codigo_barras"], id_producto_excluir=id_producto
+    ):
+        return False, "Ya existe otro producto con ese codigo de barras."
+
+    conexion = None
+
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor()
+
+        asignaciones = ", ".join(f"{campo} = ?" for campo in datos)
+        valores = list(datos.values())
+        valores.append(id_producto)
+
+        cursor.execute(
+            f"UPDATE productos SET {asignaciones} WHERE id_producto = ?;",
+            valores,
+        )
+        conexion.commit()
+
+        if cursor.rowcount == 0:
+            return False, "No se encontro un producto con ese ID."
+
+        return True, "Producto actualizado correctamente."
+    except sqlite3.IntegrityError as error:
+        if conexion:
+            conexion.rollback()
+        return False, f"No se pudo actualizar el producto: {error}"
+    except sqlite3.Error as error:
+        if conexion:
+            conexion.rollback()
+        return False, f"Error de SQLite al actualizar producto: {error}"
+    finally:
+        if conexion:
+            conexion.close()
+
+
+def eliminar_producto(id_producto):
+    """
+    Elimina un producto. Si tiene movimientos asociados, SQLite lo impedira.
+    """
+    conexion = None
+
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor()
+        cursor.execute("DELETE FROM productos WHERE id_producto = ?;", (id_producto,))
+        conexion.commit()
+
+        if cursor.rowcount == 0:
+            return False, "No se encontro un producto con ese ID."
+
+        return True, "Producto eliminado correctamente."
+    except sqlite3.IntegrityError:
+        if conexion:
+            conexion.rollback()
+        return (
+            False,
+            "No se puede eliminar el producto porque tiene movimientos asociados.",
+        )
+    except sqlite3.Error as error:
+        if conexion:
+            conexion.rollback()
+        return False, f"Error de SQLite al eliminar producto: {error}"
+    finally:
+        if conexion:
+            conexion.close()
+
+
+def buscar_producto(termino):
+    """
+    Busca productos por nombre o codigo de barras.
+    """
+    conexion = None
+
+    try:
+        conexion = obtener_conexion()
+        conexion.row_factory = sqlite3.Row
+        cursor = conexion.cursor()
+        cursor.execute(
+            """
+            SELECT
+                p.id_producto,
+                p.codigo_barras,
+                p.nombre,
+                p.descripcion,
+                p.categoria,
+                p.unidad_medida,
+                p.stock_actual,
+                p.stock_minimo,
+                p.precio_compra,
+                p.precio_venta,
+                p.id_proveedor,
+                pr.razon_social AS proveedor,
+                p.estado,
+                p.fecha_registro
+            FROM productos p
+            LEFT JOIN proveedores pr ON p.id_proveedor = pr.id_proveedor
+            WHERE p.nombre LIKE ? OR p.codigo_barras LIKE ?
+            ORDER BY p.nombre;
+            """,
+            (f"%{termino}%", f"%{termino}%"),
+        )
+        return [_fila_a_diccionario(fila) for fila in cursor.fetchall()]
+    except sqlite3.Error as error:
+        print(f"Error al buscar productos: {error}")
+        return []
+    finally:
+        if conexion:
+            conexion.close()
+
+
+def listar_productos():
+    """
+    Devuelve los productos en un DataFrame de Pandas.
+    """
+    conexion = None
+
+    try:
+        conexion = obtener_conexion()
+        consulta = """
+            SELECT
+                p.id_producto,
+                p.codigo_barras,
+                p.nombre,
+                p.descripcion,
+                p.categoria,
+                p.unidad_medida,
+                p.stock_actual,
+                p.stock_minimo,
+                p.precio_compra,
+                p.precio_venta,
+                p.id_proveedor,
+                pr.razon_social AS proveedor,
+                p.estado,
+                p.fecha_registro
+            FROM productos p
+            LEFT JOIN proveedores pr ON p.id_proveedor = pr.id_proveedor
+            ORDER BY p.nombre;
+        """
+        return pd.read_sql_query(consulta, conexion)
+    except sqlite3.Error as error:
+        print(f"Error al listar productos: {error}")
+        return pd.DataFrame()
+    finally:
+        if conexion:
+            conexion.close()
+
+
+"""
+Interfaz de consola para el modulo de productos.
+"""
+
+from productos import (
+    buscar_producto,
+    editar_producto,
+    eliminar_producto,
+    listar_productos,
+    registrar_producto,
+)
+
+
+def _leer_texto(mensaje, obligatorio=True):
+    while True:
+        valor = input(mensaje).strip()
+        if valor or not obligatorio:
+            return valor
+        print("Este campo es obligatorio.")
+
+
+def _leer_entero(mensaje, minimo=None, obligatorio=True):
+    while True:
+        valor = input(mensaje).strip()
+
+        if not valor and not obligatorio:
+            return None
+
+        try:
+            numero = int(valor)
+            if minimo is not None and numero < minimo:
+                print(f"Ingrese un numero mayor o igual a {minimo}.")
+                continue
+            return numero
+        except ValueError:
+            print("Ingrese un numero entero valido.")
+
+
+def _leer_decimal(mensaje, minimo=None, obligatorio=True):
+    while True:
+        valor = input(mensaje).strip().replace(",", ".")
+
+        if not valor and not obligatorio:
+            return None
+
+        try:
+            numero = float(valor)
+            if minimo is not None and numero < minimo:
+                print(f"Ingrese un numero mayor o igual a {minimo}.")
+                continue
+            return numero
+        except ValueError:
+            print("Ingrese un numero decimal valido.")
+
+
+def _leer_id_proveedor():
+    return _leer_entero(
+        "ID del proveedor (Enter si no aplica): ",
+        minimo=1,
+        obligatorio=False,
+    )
+
+
+def _mostrar_resultado(exito, mensaje):
+    estado = "OK" if exito else "AVISO"
+    print(f"\n[{estado}] {mensaje}")
+
+
+def _mostrar_productos_encontrados(productos):
+    if not productos:
+        print("\nNo se encontraron productos.")
+        return
+
+    print("\nProductos encontrados:")
+    for producto in productos:
+        proveedor = producto["proveedor"] or "Sin proveedor"
+        print(
+            f"{producto['id_producto']} | {producto['codigo_barras']} | "
+            f"{producto['nombre']} | Stock: {producto['stock_actual']} | "
+            f"Proveedor: {proveedor}"
+        )
+
+
+def opcion_registrar_producto():
+    print("\n=== Registrar producto ===")
+    codigo_barras = _leer_texto("Codigo de barras: ")
+    nombre = _leer_texto("Nombre: ")
+    descripcion = _leer_texto("Descripcion (Enter para omitir): ", obligatorio=False)
+    categoria = _leer_texto("Categoria (Enter para omitir): ", obligatorio=False)
+    unidad_medida = _leer_texto("Unidad de medida: ")
+    stock_actual = _leer_entero("Stock actual: ", minimo=0)
+    stock_minimo = _leer_entero("Stock minimo: ", minimo=0)
+    precio_compra = _leer_decimal("Precio de compra: ", minimo=0)
+    precio_venta = _leer_decimal("Precio de venta: ", minimo=0)
+    id_proveedor = _leer_id_proveedor()
+
+    exito, mensaje = registrar_producto(
+        codigo_barras=codigo_barras,
+        nombre=nombre,
+        descripcion=descripcion,
+        categoria=categoria,
+        unidad_medida=unidad_medida,
+        stock_actual=stock_actual,
+        stock_minimo=stock_minimo,
+        precio_compra=precio_compra,
+        precio_venta=precio_venta,
+        id_proveedor=id_proveedor,
+    )
+    _mostrar_resultado(exito, mensaje)
+
+
+def opcion_editar_producto():
+    print("\n=== Editar producto ===")
+    id_producto = _leer_entero("ID del producto a editar: ", minimo=1)
+
+    print("Deje en blanco los campos que no desea modificar.")
+    datos = {
+        "codigo_barras": _leer_texto("Nuevo codigo de barras: ", obligatorio=False),
+        "nombre": _leer_texto("Nuevo nombre: ", obligatorio=False),
+        "descripcion": _leer_texto("Nueva descripcion: ", obligatorio=False),
+        "categoria": _leer_texto("Nueva categoria: ", obligatorio=False),
+        "unidad_medida": _leer_texto("Nueva unidad de medida: ", obligatorio=False),
+        "stock_actual": _leer_entero(
+            "Nuevo stock actual: ", minimo=0, obligatorio=False
+        ),
+        "stock_minimo": _leer_entero(
+            "Nuevo stock minimo: ", minimo=0, obligatorio=False
+        ),
+        "precio_compra": _leer_decimal(
+            "Nuevo precio de compra: ", minimo=0, obligatorio=False
+        ),
+        "precio_venta": _leer_decimal(
+            "Nuevo precio de venta: ", minimo=0, obligatorio=False
+        ),
+        "id_proveedor": _leer_id_proveedor(),
+        "estado": _leer_texto("Nuevo estado: ", obligatorio=False),
+    }
+
+    datos = {campo: valor for campo, valor in datos.items() if valor not in ("", None)}
+    exito, mensaje = editar_producto(id_producto, **datos)
+    _mostrar_resultado(exito, mensaje)
+
+
+def opcion_eliminar_producto():
+    print("\n=== Eliminar producto ===")
+    id_producto = _leer_entero("ID del producto a eliminar: ", minimo=1)
+    confirmacion = input("Confirme la eliminacion escribiendo SI: ").strip().upper()
+
+    if confirmacion != "SI":
+        print("Eliminacion cancelada.")
+        return
+
+    exito, mensaje = eliminar_producto(id_producto)
+    _mostrar_resultado(exito, mensaje)
+
+
+def opcion_buscar_producto():
+    print("\n=== Buscar producto ===")
+    termino = _leer_texto("Ingrese nombre o codigo de barras: ")
+    productos = buscar_producto(termino)
+    _mostrar_productos_encontrados(productos)
+
+
+def opcion_listar_productos():
+    print("\n=== Listar productos ===")
+    dataframe = listar_productos()
+
+    if dataframe.empty:
+        print("No hay productos registrados.")
+        return
+
+    print(dataframe.to_string(index=False))
+
+
+def mostrar_menu_productos():
+    while True:
+        print(
+            """
+=== Modulo de productos ===
+1. Registrar producto
+2. Editar producto
+3. Eliminar producto
+4. Buscar producto
+5. Listar productos
+0. Volver / salir
+"""
+        )
+        opcion = input("Seleccione una opcion: ").strip()
+
+        if opcion == "1":
+            opcion_registrar_producto()
+        elif opcion == "2":
+            opcion_editar_producto()
+        elif opcion == "3":
+            opcion_eliminar_producto()
+        elif opcion == "4":
+            opcion_buscar_producto()
+        elif opcion == "5":
+            opcion_listar_productos()
+        elif opcion == "0":
+            print("Saliendo del modulo de productos.")
+            break
+        else:
+            print("Opcion no valida. Intente nuevamente.")
+
+
+"""
+Configuracion global del sistema de gestion de almacen.
+
+Este modulo centraliza valores compartidos para que otros archivos del
+proyecto puedan importarlos sin repetir rutas o nombres de recursos.
+"""
+
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+DATABASE_NAME = "almacen.db"
+DATABASE_PATH = BASE_DIR / DATABASE_NAME
+
+
+"""
+Modulo de conexion e inicializacion de la base de datos SQLite.
+"""
+
+import sqlite3
+
+from config import DATABASE_PATH
+
+
+SCRIPT_CREACION_TABLAS = """
+CREATE TABLE IF NOT EXISTS proveedores (
+    id_proveedor INTEGER PRIMARY KEY AUTOINCREMENT,
+    ruc TEXT NOT NULL UNIQUE,
+    razon_social TEXT NOT NULL,
+    nombre_contacto TEXT,
+    telefono TEXT,
+    correo TEXT UNIQUE,
+    direccion TEXT,
+    estado TEXT NOT NULL DEFAULT 'activo',
+    fecha_registro TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS usuarios (
+    id_usuario INTEGER PRIMARY KEY AUTOINCREMENT,
+    tipo_documento TEXT NOT NULL,
+    numero_documento TEXT NOT NULL UNIQUE,
+    nombres TEXT NOT NULL,
+    apellidos TEXT NOT NULL,
+    correo TEXT NOT NULL UNIQUE,
+    usuario TEXT NOT NULL UNIQUE,
+    contrasena TEXT NOT NULL,
+    rol TEXT NOT NULL,
+    estado TEXT NOT NULL DEFAULT 'activo',
+    fecha_registro TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS productos (
+    id_producto INTEGER PRIMARY KEY AUTOINCREMENT,
+    codigo_barras TEXT NOT NULL UNIQUE,
+    nombre TEXT NOT NULL,
+    descripcion TEXT,
+    categoria TEXT,
+    unidad_medida TEXT NOT NULL,
+    stock_actual INTEGER NOT NULL DEFAULT 0,
+    stock_minimo INTEGER NOT NULL DEFAULT 0,
+    precio_compra REAL NOT NULL DEFAULT 0,
+    precio_venta REAL NOT NULL DEFAULT 0,
+    id_proveedor INTEGER,
+    estado TEXT NOT NULL DEFAULT 'activo',
+    fecha_registro TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (id_proveedor)
+        REFERENCES proveedores(id_proveedor)
+        ON UPDATE CASCADE
+        ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS movimientos (
+    id_movimiento INTEGER PRIMARY KEY AUTOINCREMENT,
+    id_producto INTEGER NOT NULL,
+    id_usuario INTEGER NOT NULL,
+    tipo_movimiento TEXT NOT NULL,
+    cantidad INTEGER NOT NULL,
+    fecha_movimiento TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    motivo TEXT,
+    observacion TEXT,
+
+    FOREIGN KEY (id_producto)
+        REFERENCES productos(id_producto)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT,
+
+    FOREIGN KEY (id_usuario)
+        REFERENCES usuarios(id_usuario)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT
+);
+"""
+
+
+def obtener_conexion():
+    """
+    Abre una conexion a SQLite y activa el soporte de llaves foraneas.
+    """
+    conexion = sqlite3.connect(DATABASE_PATH)
+    conexion.execute("PRAGMA foreign_keys = ON;")
+    return conexion
+
+
+def inicializar_base_datos():
+    """
+    Crea las tablas principales del sistema si aun no existen.
+    """
+    conexion = None
+
+    try:
+        conexion = obtener_conexion()
+        conexion.executescript(SCRIPT_CREACION_TABLAS)
+        conexion.commit()
+        print("Base de datos inicializada correctamente.")
+    except sqlite3.Error as error:
+        if conexion:
+            conexion.rollback()
+        print(f"Error al inicializar la base de datos: {error}")
+    finally:
+        if conexion:
+            conexion.close()
+
